@@ -1,0 +1,154 @@
+pipeline {
+    agent {
+        label '' // 기본 에이전트
+    }
+    
+    environment {
+        // AWS 관련 환경 변수
+        GIT_BRANCH = 'main'
+        GIT_REPO = 'https://github.com/HowwAbout/AI-model'
+        AWS_REGION = 'ap-northeast-2'
+        
+        // Terraform 및 Ansible 관련 환경 변수
+        TERRAFORM_DIR = '/home/ubuntu/jenkins/howabout/terraform-project/ai'
+        TERRAFORM_APPLY_FLAG = '${TERRAFORM_DIR}/.terraform_apply_completed'
+        INVENTORY_FILE = '/home/ubuntu/jenkins/howabout/ansible-project/ai/inventory.ini'
+        ANSIBLE_PLAYBOOK = '/home/ubuntu/jenkins/howabout/ansible-project/ai/site.yml'
+        // FIXED_EIP = '13.209.187.32'
+        PYTHON_SCRIPT = '/home/ubuntu/jenkins/howabout/ansible-project/ai/generate_inventory.py'
+    }
+
+    stages {
+        stage('Check for Previous Builds') {
+            steps {
+                script {
+                    // 현재 Job에서 실행 중인 이전 빌드를 가져옴
+                    def job = Jenkins.instance.getItemByFullName(env.JOB_NAME)
+                    def currentBuildNumber = currentBuild.number
+                    
+                    // 이전 빌드가 실행 중이면 중단시킴
+                    job.builds.each { build ->
+                        if (build.isBuilding() && build.number < currentBuildNumber) {
+                            echo "Cancelling build #${build.number}"
+                            build.doStop()  // 이전 빌드를 중단
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Destroy Existing Infrastructure') {
+            agent { label 'cd-agent' }
+            steps {
+                script {
+                    node('cd-agent') {
+                        dir("${TERRAFORM_DIR}") {
+                            echo 'Checking for existing infrastructure...'
+                            if (fileExists(".terraform_apply_completed")) {
+                                echo 'Existing infrastructure detected. Destroying resources...'
+                                sh 'terraform init'
+                                sh 'terraform destroy -auto-approve'
+                                sh "rm -f ${TERRAFORM_APPLY_FLAG}"
+                            } else {
+                                echo 'No existing infrastructure detected. Skipping destroy...'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Infrastructure and Application') {
+            agent { label 'cd-agent' }
+            steps {
+                script {
+                    node('cd-agent') {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials-id']]) {
+                            dir("${TERRAFORM_DIR}") {
+                                echo 'Initializing Terraform...'
+                                sh 'terraform init'
+                                
+                                echo 'Applying Terraform configuration...'
+                                sh 'terraform apply -auto-approve'
+                                sh "touch ${TERRAFORM_APPLY_FLAG}"
+                            }
+                        }
+
+                        echo 'Waiting for 30 seconds to allow the server to be fully ready...'
+                        sleep(time: 30, unit: 'SECONDS')
+
+                        // env.INSTANCE_IP = "${FIXED_EIP}"
+                        // echo "Instance IP: ${env.INSTANCE_IP}"
+                        // writeFile file: "${INVENTORY_FILE}", text: "[frontservers]\n${env.INSTANCE_IP} ansible_user=ubuntu ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n"
+                        
+                        // dir("${TERRAFORM_DIR}") ~ echo "Instance IP: ${env.INSTANCE_IP}" 코드는 EIP를 받을 경우 주석
+                        dir("${TERRAFORM_DIR}") {
+                            sh 'terraform output -json > terraform_output.json'
+                        }
+                        
+                        dir('/home/ubuntu/jenkins/howabout/ansible-project/ai') {
+                            // JSON 파일을 사용해 인벤토리 파일 생성
+                            sh "python3 ${PYTHON_SCRIPT} ${TERRAFORM_DIR}/terraform_output.json ${INVENTORY_FILE}"
+                        }
+                            
+                        // IP 주소를 Jenkins 환경 변수로 저장
+                        dir("${TERRAFORM_DIR}") {
+                            def instanceIp = sh(script: 'jq -r ".ai_instance_ip.value[0]" terraform_output.json', returnStdout: true).trim()
+                            env.INSTANCE_IP = instanceIp
+                        }
+                            
+                        // 디버깅을 위한 출력
+                        echo "Instance IP: ${env.INSTANCE_IP}"
+                        
+                        sh "ssh-keygen -f '/home/ubuntu/.ssh/known_hosts' -R '${env.INSTANCE_IP}'"
+                        
+                        sshagent(['ssh-agent-credentials-id']) {
+                            echo 'Starting SSH service on the instance...'
+                            sh """
+                                ssh -o StrictHostKeyChecking=no ubuntu@${env.INSTANCE_IP} 'sudo systemctl start ssh'
+                            """
+
+                            echo 'Running Ansible Playbook...'
+                            withCredentials([[
+                                $class: 'AmazonWebServicesCredentialsBinding',
+                                credentialsId: 'aws-credentials-id',
+                                accessKeyIdVariable: 'AWS_ACCESS_KEY_ID',
+                                secretAccessKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                            ]]) {
+                                echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}"
+                                echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}"
+                                sh "ansible-playbook -i ${INVENTORY_FILE} ${ANSIBLE_PLAYBOOK}"
+                            }
+                        }
+
+                        // Wait for Cleanup
+                        sleep(time: 60, unit: 'MINUTES')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                node('cd-agent') {
+                    dir("${TERRAFORM_DIR}") {
+                        if (fileExists(".terraform_apply_completed")) {
+                            echo 'Terraform apply detected. Destroying resources...'
+                            sh 'terraform init'
+                            sh 'terraform destroy -auto-approve'
+                        } else {
+                            echo 'Terraform apply not detected. Skipping destroy...'
+                        }
+                    }
+                    sh "rm -f ${TERRAFORM_APPLY_FLAG}"
+                    sh 'docker image prune -a -f'
+                }
+
+                // 작업 공간 삭제
+                deleteDir()
+            }
+        }
+    }
+}

@@ -1,0 +1,140 @@
+- name: Deploy back server using Docker
+  hosts: backservers
+  become: yes
+  vars:
+    s3_bucket: "rainfallbucket"
+    s3_base_path: "back/db-container"
+    dockerfile_path: "{{ s3_base_path }}/Dockerfile"
+    docker_compose_path: "{{ s3_base_path }}/docker-compose.yml"
+    remote_user: "ubuntu"
+    aws_access_key_id: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    aws_secret_access_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+  tasks:
+    - name: Add Jenkins public key to authorized_keys
+      authorized_key:
+        user: ubuntu
+        state: present
+        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCiEoTwLPsz+ggorBYQMVKZoQPl1+k9pSuwZwHesIbTEp9SjVsu5nQYOii5LDrNFbcC5YGJf8j0rkBlG8US9wf9MIfUitoXjsB4XSTf2CdSVwzhS3nxD66+Z0hH1HXrw4QQhu6vCPSTkBycPt+uNn/p9MX3E6ji8XMq5L5630zFYyxGLkgsramljL4DBrGgCjwU0EJyM8AjsdNqAiwY4UjQAZi+2Ar8ka0Jp0xvd6g1ScyH8ESFJmIt1OnZ2h109mOLi8ARUneBII6f6USZkU+gHFlrfUjCRWOQVetpvdHcvSSW2oMOwR8nTrxYgL/dlnsqev2nMpEkrBC3BLUlA14+sW9fDmsb3o0/lGpNUza+u6D7VEXqN3wj7ap9ahhN11WLcRTi1nHjJfAy5LZSoZnDBh9/1Y9tTIUuCE2OZTnjx9JF8R1bBgmpEGZ750Izz6kwxoIL0iVEFj/rbQVlG3DNoDx6wPhhqgADntJrWVZoTIu+Q21NBK//uPa5zY9WiW8BMniaoqoj4mvPDr4R9ATT6850PlBf98CAKzimdJIkWF09q+Gz+Cm3M6JpBZAoNZo0zN1JQWT0kCAToLecUrdM7h/N66e74teNSxOBzHNVYUCEW3ZrEye817N/iAL6/WxToQ3OSL1klO7KMyOq2EtvEboIxBaBt6Lv4ccOIN8Kbw== uniti0903@naver.com"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install dependencies for AWS CLI
+      apt:
+        name:
+          - unzip
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Download AWS CLI
+      get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+        dest: "/tmp/awscliv2.zip"
+
+    - name: Unzip AWS CLI
+      unarchive:
+        src: "/tmp/awscliv2.zip"
+        dest: "/tmp"
+        remote_src: yes
+
+    - name: Install AWS CLI
+      shell: "/tmp/aws/install --update"
+      ignore_errors: yes
+
+    - name: Install prerequisites for Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Update apt cache after adding Docker repository
+      apt:
+        update_cache: yes
+
+    - name: Install latest version of Docker
+      apt:
+        name: docker-ce
+        state: latest
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Get system architecture
+      shell: uname -m
+      register: system_architecture
+      changed_when: false
+
+    - name: Get operating system name
+      shell: uname -s
+      register: system_os
+      changed_when: false
+
+    - name: Download the latest version of Docker Compose
+      get_url:
+        url: "https://github.com/docker/compose/releases/latest/download/docker-compose-{{ system_os.stdout }}-{{ system_architecture.stdout }}"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    - name: Verify Docker Compose version
+      shell: docker-compose --version
+      register: docker_compose_version
+
+    - debug:
+        var: docker_compose_version.stdout
+
+    - name: Install Python dependencies for AWS
+      apt:
+        name: python3-boto3
+        state: present
+        update_cache: yes
+
+    - name: Download Docker Compose file from S3
+      aws_s3:
+        bucket: "{{ s3_bucket }}"
+        object: "{{ docker_compose_path }}"
+        dest: /home/{{ remote_user }}/docker-compose.yml
+        mode: get
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
+
+    - name: Set permissions for Docker Compose file
+      file:
+        path: /home/{{ remote_user }}/docker-compose.yml
+        mode: '0644'
+
+    - name: Login to AWS ECR
+      shell: |
+        aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin 211125355246.dkr.ecr.ap-northeast-2.amazonaws.com
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
+      register: login_output
+      ignore_errors: no
+
+    - name: Start containers with Docker Compose
+      shell: |
+        docker-compose -f /home/{{ remote_user }}/docker-compose.yml up -d
+      args:
+        chdir: /home/{{ remote_user }}

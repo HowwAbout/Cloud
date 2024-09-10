@@ -1,0 +1,13 @@
+server {
+    listen 80;
+
+    server_name 13.209.187.32;  # 타겟 서버의 IP 주소
+
+    location / {
+        proxy_pass http://localhost:3000;  # TypeScript 애플리케이션이 실행 중인 포트
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

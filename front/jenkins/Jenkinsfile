@@ -1,0 +1,186 @@
+pipeline {
+    agent {
+        label '' // 기본 에이전트
+    }
+    
+    environment {
+        // Docker 관련 환경 변
+        GIT_BRANCH = 'main'
+        GIT_REPO = 'https://github.com/chanyoungit/Rainfall-Front'
+        S3_BUCKET = 'howabout'
+        S3_DOCKERFILE_PATH = 'front/Dockerfile'
+        DOCKER_IMAGE_NAME = 'howabout'
+        AWS_REGION = 'ap-northeast-2'
+        ECR_REGISTRY = '211125355246.dkr.ecr.ap-northeast-2.amazonaws.com'
+        ECR_TAG = 'front'
+        
+        // Terraform 및 Ansible 관련 환경 변수
+        TERRAFORM_DIR = '/home/ubuntu/jenkins/howabout/terraform-project/front'
+        TERRAFORM_APPLY_FLAG = '${TERRAFORM_DIR}/.terraform_apply_completed'
+        FIXED_EIP = '13.209.187.32'
+        INVENTORY_FILE = '/home/ubuntu/jenkins/howabout/ansible-project/front/inventory.ini'
+        ANSIBLE_PLAYBOOK = '/home/ubuntu/jenkins/howabout/ansible-project/front/site.yml'
+    }
+
+    stages {
+        stage('Check for Previous Builds') {
+            steps {
+                script {
+                    // 현재 Job에서 실행 중인 이전 빌드를 가져옴
+                    def job = Jenkins.instance.getItemByFullName(env.JOB_NAME)
+                    def currentBuildNumber = currentBuild.number
+                    
+                    // 이전 빌드가 실행 중이면 중단시킴
+                    job.builds.each { build ->
+                        if (build.isBuilding() && build.number < currentBuildNumber) {
+                            echo "Cancelling build #${build.number}"
+                            build.doStop()  // 이전 빌드를 중단
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Destroy Existing Infrastructure') {
+            agent { label 'cd-agent' }
+            steps {
+                script {
+                    node('cd-agent') {
+                        dir("${TERRAFORM_DIR}") {
+                            echo 'Checking for existing infrastructure...'
+                            if (fileExists(".terraform_apply_completed")) {
+                                echo 'Existing infrastructure detected. Destroying resources...'
+                                sh 'terraform init'
+                                sh 'terraform destroy -auto-approve'
+                                sh "rm -f ${TERRAFORM_APPLY_FLAG}"
+                            } else {
+                                echo 'No existing infrastructure detected. Skipping destroy...'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            agent { label 'ci-agent' }
+            steps {
+                script {
+                    node('ci-agent') {
+                        echo 'Cleaning up workspace...'
+                        sh 'docker image prune -a -f'
+                        sh 'rm -rf ${WORKSPACE}/* || true'
+
+                        echo 'Cloning Git repository...'
+                        git branch: "${GIT_BRANCH}", url: "${GIT_REPO}"
+
+                        echo 'Installing dependencies...'
+                        sh 'unset CI && npm install'
+
+                        echo 'Building project...'
+                        sh 'unset CI && npm run build'
+
+                        echo 'Downloading Dockerfile from S3...'
+                        withCredentials([[
+                            $class: 'AmazonWebServicesCredentialsBinding',
+                            credentialsId: 'aws-credentials-id',
+                            accessKeyIdVariable: 'AWS_ACCESS_KEY_ID',
+                            secretAccessKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            sh 'aws s3 cp s3://${S3_BUCKET}/${S3_DOCKERFILE_PATH} .'
+                        }
+
+                        echo 'Building Docker image...'
+                        dockerImage = docker.build("${DOCKER_IMAGE_NAME}", '-f Dockerfile .')
+
+                        echo 'Pushing Docker image to ECR...'
+                        sh 'aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}'
+                        def ecrImageTag = "${ECR_REGISTRY}/${DOCKER_IMAGE_NAME}:${ECR_TAG}"
+                        sh "docker tag ${DOCKER_IMAGE_NAME}:latest ${ecrImageTag}"
+                        sh "docker push ${ecrImageTag}"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Infrastructure and Application') {
+            agent { label 'cd-agent' }
+            steps {
+                script {
+                    node('cd-agent') {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials-id']]) {
+                            dir("${TERRAFORM_DIR}") {
+                                echo 'Initializing Terraform...'
+                                sh 'terraform init'
+                                
+                                echo 'Applying Terraform configuration...'
+                                sh 'terraform apply -auto-approve'
+                                sh "touch ${TERRAFORM_APPLY_FLAG}"
+                            }
+                        }
+
+                        echo 'Waiting for 30 seconds to allow the server to be fully ready...'
+                        sleep(time: 30, unit: 'SECONDS')
+
+                        env.INSTANCE_IP = "${FIXED_EIP}"  // 고정된 탄력적 IP
+                        echo "Instance IP: ${env.INSTANCE_IP}"
+                        writeFile file: "${INVENTORY_FILE}", text: "[frontservers]\n${env.INSTANCE_IP} ansible_user=ubuntu ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n"
+                        
+                        sh "ssh-keygen -f '/home/ubuntu/.ssh/known_hosts' -R '${env.INSTANCE_IP}'"
+                        
+                        sshagent(['ssh-agent-credentials-id']) {
+                            echo 'Starting SSH service on the instance...'
+                            sh """
+                                ssh -o StrictHostKeyChecking=no ubuntu@${env.INSTANCE_IP} 'sudo systemctl start ssh'
+                            """
+
+                            echo 'Running Ansible Playbook...'
+                            withCredentials([[
+                                $class: 'AmazonWebServicesCredentialsBinding',
+                                credentialsId: 'aws-credentials-id',
+                                accessKeyIdVariable: 'AWS_ACCESS_KEY_ID',
+                                secretAccessKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                            ]]) {
+                                echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}"
+                                echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}"
+                                sh "ansible-playbook -i ${INVENTORY_FILE} ${ANSIBLE_PLAYBOOK}"
+                            }
+                        }
+
+                        // Wait for Cleanup
+                        sleep(time: 1, unit: 'MINUTES')
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                node('cd-agent') {
+                    dir("${TERRAFORM_DIR}") {
+                        if (fileExists(".terraform_apply_completed")) {
+                            echo 'Terraform apply detected. Destroying resources...'
+                            sh 'terraform init'
+                            sh 'terraform destroy -auto-approve'
+                        } else {
+                            echo 'Terraform apply not detected. Skipping destroy...'
+                        }
+                    }
+                    sh "rm -f ${TERRAFORM_APPLY_FLAG}"
+                    sh 'docker image prune -a -f'
+                }
+
+                node('ci-agent') {
+                    echo 'Cleaning up temporary files and Docker images...'
+                    sh 'rm -rf ${WORKSPACE}/* || true'
+                    sh 'docker image prune -a -f'
+                }
+
+                // 작업 공간 삭제
+                deleteDir()
+            }
+        }
+    }
+}

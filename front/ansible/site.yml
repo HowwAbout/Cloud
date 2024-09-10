@@ -1,0 +1,96 @@
+- name: Deploy front server using Docker from ECR and configure Nginx as a reverse proxy
+  hosts: frontservers
+  become: yes
+  vars:
+    docker_image: "{{ lookup('env', 'ECR_REGISTRY') }}/howabout:{{ lookup('env', 'ECR_TAG') }}"  # ECR에서 사용할 이미지 태그
+    container_name: "howabout_front"
+    deploy_dir: "/var/www/html"
+    aws_region: "ap-northeast-2"  # AWS 리전은 환경 변수에서 받지 않고 직접 지정
+
+  tasks:
+    - name: Update apt cache and install Docker, Nginx, and dependencies
+      apt:
+        name:
+          - docker.io
+          - unzip
+          - curl
+          - nginx  # Nginx 설치 추가
+        state: present
+        update_cache: yes
+
+    - name: Create Nginx configuration directories if they don't exist
+      file:
+        path: /etc/nginx/sites-available
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create sites-enabled directory if it doesn't exist
+      file:
+        path: /etc/nginx/sites-enabled
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install AWS CLI
+      shell: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+        unzip /tmp/awscliv2.zip -d /tmp/
+        /tmp/aws/install --update
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Login to AWS ECR
+      shell: |
+        aws ecr get-login-password --region {{ aws_region }} | docker login --username AWS --password-stdin {{ lookup('env', 'ECR_REGISTRY') }}
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+    - name: Pull the Docker image from ECR
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+
+    - name: Stop and remove existing frontend container if running
+      docker_container:
+        name: "{{ container_name }}"
+        state: absent
+        force_kill: yes
+
+    - name: Run Docker container for frontend
+      docker_container:
+        name: "{{ container_name }}"
+        image: "{{ docker_image }}"
+        state: started
+        volumes:
+          - "{{ deploy_dir }}:/usr/share/nginx/html"
+        published_ports:
+          - "3000:3000"
+
+    # Nginx 서버를 reverse proxy로 설정하는 작업 추가
+    - name: Create Nginx reverse proxy configuration
+      template:
+        src: /home/ubuntu/jenkins/howabout/ansible-project/front/nginx_proxy.conf.j2  # 명시적인 절대 경로
+        dest: /etc/nginx/sites-available/frontend.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable Nginx site configuration
+      file:
+        src: /etc/nginx/sites-available/frontend.conf
+        dest: /etc/nginx/sites-enabled/frontend.conf
+        state: link
+
+    - name: Remove default Nginx site configuration (optional)
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart Nginx to apply changes
+      service:
+        name: nginx
+        state: restarted

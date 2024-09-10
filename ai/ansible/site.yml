@@ -1,0 +1,75 @@
+- name: Deploy back server using Docker
+  hosts: aiservers
+  become: yes
+  vars:
+    #docker_image: "jwywoo/rag_test:latest"
+    docker_image: "chanyoungit/howabout-ai:latest"
+    remote_user: "ubuntu"
+    container_name: "ai_container"
+
+  tasks:
+    - name: Add Jenkins public key to authorized_keys
+      authorized_key:
+        user: ubuntu
+        state: present
+        key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCVjdE/fpvA/Ck0+JkfRGaOtPyXJgYlb23JDQ7dcunhpydwtqFBZP0Xq0s7M8VR2IRH+7aGqo6TOYuoYsBfrW0oVQNVyAufJRdTLJg/bes9Dxk8s8sfMcAqM/X+JvXgBt3aXyVNgc0bh42FwwX52OjKO6LcMD+X6oBRqV2c8WxVCjn6cmQWHXOzp2N28XE6/c2LoucB1yxXvEh8QjPyr6B27aRPUKq+Mh3D9H+xbQvrmKYb1sgFPMxJ/uO1pvq+qVFkXUZVuYt5TiYIfCrd091mTfjT/ZAuhKga7eHB+iC8CLtRffKKvi57J3nq2l56qZ5UT1mT1Ks4+zH+aQpJFA7dtFc1xLfYcs1nAzdGYCUf0cBoDi+sKmWua9hkwA3f6lohFc/A+hcP+SlqZ7pxOZWuiIqsgAxRmN1DDPiMmpPmjhdu1bDSYD2evdIUpPLl7XHw4sMQWt82m+ovTWZbXK+5FZQTFxjj83fFFtieguic4XacMmVT0rvroaGPofVUeqmaAOm/J8+XkNLlmBRPR6nxkuRkURmwlEUWqWO6CWGMkKKnlsPmbqph+/kHoodZZ8ehZg93RaIa401uJuFy0z4E/mkT7x5WU3byfnZk8rx7v5vU1yNaBg2Uo7kF4U+70mJfbGbi70MRICEOCLGozcgvB0Qt1ytZvPNKQb/PhIeHnw== uniti2037@gmail.com"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install prerequisites for Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Update apt cache after adding Docker repository
+      apt:
+        update_cache: yes
+
+    - name: Install latest version of Docker
+      apt:
+        name: docker-ce
+        state: latest
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Pull Docker image from Docker Hub
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+
+    - name: Stop and remove any existing container with the same name
+      docker_container:
+        name: "{{ container_name }}"
+        state: absent
+        force_kill: true
+
+    - name: Run Docker container
+      docker_container:
+        name: "{{ container_name }}"
+        image: "{{ docker_image }}"
+        state: started
+        ports:
+          - "8000:80"  # 수정이 필요할 수 있는 포트 매핑
+        restart_policy: always
